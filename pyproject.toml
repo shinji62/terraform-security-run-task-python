@@ -1,0 +1,14 @@
+[project]
+name = "terraform-security-run-task-python"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "fastapi[standard]>=0.136.3",
+    "google-adk[extensions]>=2.2.0",
+    "httpx>=0.28.1",
+    "loguru>=0.7.3",
+    "ngrok>=1.7.0",
+    "python-dotenv>=1.2.2",
+]
