@@ -2,6 +2,9 @@ import json
 import unittest
 import hashlib
 import hmac
+from unittest.mock import AsyncMock, patch
+
+from fastapi.testclient import TestClient
 
 from models.agents_output_sec import (
     SecurityFinding,
@@ -10,7 +13,7 @@ from models.agents_output_sec import (
     SeverityLevel,
 )
 from models.run_task_handler import CallbackRequest, TaskStatus
-from run_task import TaskRunHandler, format_output
+from run_task import TEST_TOKEN, TaskRunHandler, format_output
 
 
 class FormatOutputTests(unittest.TestCase):
@@ -111,6 +114,216 @@ class FormatOutputTests(unittest.TestCase):
         self.assertTrue(handler.verify_header_signature(signature, body))
         self.assertFalse(handler.verify_header_signature("bad-signature", body))
         self.assertFalse(handler.verify_header_signature(None, body))
+
+
+VALID_PAYLOAD = {
+    "access_token": TEST_TOKEN,
+    "is_speculative": False,
+    "organization_name": "test-org",
+    "payload_version": 1,
+    "run_app_url": "https://app.terraform.io/app/test-org/runs/run-123",
+    "run_created_at": "2024-01-01T00:00:00Z",
+    "run_created_by": "user@example.com",
+    "run_id": "run-123",
+    "run_message": "Triggered via UI",
+    "stage": "post_plan",
+    "task_result_callback_url": "https://app.terraform.io/tasks/callback-123",
+    "task_result_enforcement_level": "advisory",
+    "task_result_id": "taskrs-123",
+    "workspace_app_url": "https://app.terraform.io/app/test-org/workspaces/ws-123",
+    "workspace_id": "ws-123",
+    "workspace_name": "test-workspace",
+}
+
+HMAC_SECRET = "test"
+
+
+def _sign(body: bytes, secret: str = HMAC_SECRET) -> str:
+    """Compute the HMAC-SHA512 hex digest for a request body."""
+    return hmac.new(
+        key=secret.encode("utf-8"),
+        msg=body,
+        digestmod=hashlib.sha512,
+    ).hexdigest()
+
+
+class RunTaskEndpointTests(unittest.TestCase):
+    """Integration-style tests for the POST /run-task HTTP endpoint."""
+
+    def setUp(self):
+        # Import here so patching HEADER_SIGNATURE_VALUE is already in place
+        # when the module-level variable is read in each request handler.
+        from main import app
+
+        self.client = TestClient(app, raise_server_exceptions=False)
+
+    # ------------------------------------------------------------------
+    # Middleware: missing header
+    # ------------------------------------------------------------------
+
+    def test_missing_signature_header_returns_401(self):
+        body = json.dumps(VALID_PAYLOAD).encode()
+        response = self.client.post(
+            "/run-task",
+            content=body,
+            headers={"Content-Type": "application/json"},
+        )
+        self.assertEqual(response.status_code, 401)
+
+    # ------------------------------------------------------------------
+    # Endpoint: invalid signature
+    # ------------------------------------------------------------------
+
+    def test_invalid_signature_returns_401(self):
+        body = json.dumps(VALID_PAYLOAD).encode()
+        response = self.client.post(
+            "/run-task",
+            content=body,
+            headers={
+                "Content-Type": "application/json",
+                "X-Tfc-Task-Signature": "not-a-valid-signature",
+            },
+        )
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(response.json(), {"message": "Signature verification failed."})
+
+    # ------------------------------------------------------------------
+    # Endpoint: valid signature + test token (short-circuit path)
+    # ------------------------------------------------------------------
+
+    def test_valid_signature_with_test_token_returns_200(self):
+        body = json.dumps(VALID_PAYLOAD).encode()
+        signature = _sign(body)
+        response = self.client.post(
+            "/run-task",
+            content=body,
+            headers={
+                "Content-Type": "application/json",
+                "X-Tfc-Task-Signature": signature,
+            },
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.json(),
+            {"message": "Run Task received and verified successfully!"},
+        )
+
+    # ------------------------------------------------------------------
+    # Endpoint: full flow — mock plan download, Gemini agent, callback
+    # ------------------------------------------------------------------
+
+    def test_full_flow_returns_200(self):
+        payload = {**VALID_PAYLOAD, "access_token": "real-token"}
+        body = json.dumps(payload).encode()
+        signature = _sign(body)
+
+        mock_report = SecurityReport(
+            status=SecurityStatus.PASSED,
+            summary="No security issues found.",
+            findings=[],
+        )
+
+        with (
+            patch(
+                "run_task.TaskRunHandler.download_plan_json",
+                new_callable=AsyncMock,
+                return_value='{"planned_values": {}}',
+            ),
+            patch(
+                "main.agent_runner.run",
+                new_callable=AsyncMock,
+                return_value=mock_report,
+            ),
+            patch(
+                "run_task.TaskRunHandler.send_callback",
+                new_callable=AsyncMock,
+            ) as mock_send_callback,
+        ):
+            response = self.client.post(
+                "/run-task",
+                content=body,
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Tfc-Task-Signature": signature,
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {})
+        mock_send_callback.assert_awaited_once()
+        _, kwargs = mock_send_callback.call_args
+        self.assertEqual(kwargs["status_task"], TaskStatus.PASSED)
+
+    # ------------------------------------------------------------------
+    # Endpoint: plan download failure → 500
+    # ------------------------------------------------------------------
+
+    def test_plan_download_failure_returns_500(self):
+        payload = {**VALID_PAYLOAD, "access_token": "real-token"}
+        body = json.dumps(payload).encode()
+        signature = _sign(body)
+
+        with (
+            patch(
+                "run_task.TaskRunHandler.download_plan_json",
+                new_callable=AsyncMock,
+                side_effect=RuntimeError("network error"),
+            ),
+            patch(
+                "run_task.TaskRunHandler.send_failure_callback",
+                new_callable=AsyncMock,
+            ) as mock_failure,
+        ):
+            response = self.client.post(
+                "/run-task",
+                content=body,
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Tfc-Task-Signature": signature,
+                },
+            )
+
+        self.assertEqual(response.status_code, 500)
+        self.assertEqual(response.json(), {"message": "Failed to download plan JSON."})
+        mock_failure.assert_awaited_once()
+
+    # ------------------------------------------------------------------
+    # Endpoint: agent execution failure → 500
+    # ------------------------------------------------------------------
+
+    def test_agent_failure_returns_500(self):
+        payload = {**VALID_PAYLOAD, "access_token": "real-token"}
+        body = json.dumps(payload).encode()
+        signature = _sign(body)
+
+        with (
+            patch(
+                "run_task.TaskRunHandler.download_plan_json",
+                new_callable=AsyncMock,
+                return_value='{"planned_values": {}}',
+            ),
+            patch(
+                "main.agent_runner.run",
+                new_callable=AsyncMock,
+                side_effect=RuntimeError("gemini error"),
+            ),
+            patch(
+                "run_task.TaskRunHandler.send_failure_callback",
+                new_callable=AsyncMock,
+            ) as mock_failure,
+        ):
+            response = self.client.post(
+                "/run-task",
+                content=body,
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Tfc-Task-Signature": signature,
+                },
+            )
+
+        self.assertEqual(response.status_code, 500)
+        self.assertEqual(response.json(), {"message": "Agent execution failed."})
+        mock_failure.assert_awaited_once()
 
 
 if __name__ == "__main__":
