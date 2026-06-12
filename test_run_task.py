@@ -255,6 +255,107 @@ class RunTaskEndpointTests(unittest.TestCase):
         self.assertEqual(kwargs["status_task"], TaskStatus.PASSED)
 
     # ------------------------------------------------------------------
+    # Endpoint: full flow — verify callback contains structured outcomes
+    # ------------------------------------------------------------------
+
+    def test_full_flow_callback_contains_correct_outcomes(self):
+        """Agent returns a structured SecurityReport with findings; verify the
+        callback is sent with a CallbackRequest whose outcomes match."""
+        payload = {**VALID_PAYLOAD, "access_token": "real-token"}
+        body = json.dumps(payload).encode()
+        signature = _sign(body)
+
+        mock_report = SecurityReport(
+            status=SecurityStatus.FAILED,
+            summary="Found one critical issue.",
+            findings=[
+                SecurityFinding(
+                    severity=SeverityLevel.CRITICAL,
+                    title="Exposed secret in environment variable",
+                    description="A secret is stored in plaintext as an env var.",
+                    resource_name="aws_lambda_function.api",
+                    resource_type="aws_lambda_function",
+                    recommendation="Use AWS Secrets Manager instead.",
+                    estimated_impact="Credentials may be leaked.",
+                )
+            ],
+        )
+
+        with (
+            patch(
+                "run_task.TaskRunHandler.download_plan_json",
+                new_callable=AsyncMock,
+                return_value='{"planned_values": {}}',
+            ),
+            patch(
+                "main.agent_runner.run",
+                new_callable=AsyncMock,
+                return_value=mock_report,
+            ),
+            patch(
+                "run_task.TaskRunHandler.send_callback",
+                new_callable=AsyncMock,
+            ) as mock_send_callback,
+        ):
+            response = self.client.post(
+                "/run-task",
+                content=body,
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Tfc-Task-Signature": signature,
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        mock_send_callback.assert_awaited_once()
+
+        _, kwargs = mock_send_callback.call_args
+
+        # main.py always passes status_task=PASSED; the real status is embedded
+        # inside the callback_request produced by format_output.
+        self.assertEqual(kwargs["status_task"], TaskStatus.PASSED)
+
+        # callback_request must be a fully-formed CallbackRequest with outcomes
+        cb: CallbackRequest = kwargs["callback_request"]
+        self.assertIsInstance(cb, CallbackRequest)
+        self.assertEqual(cb.data.attributes.status, TaskStatus.FAILED)
+        self.assertEqual(cb.data.attributes.message, "Found one critical issue.")
+
+        assert cb.data.relationships is not None
+        assert cb.data.relationships.outcomes is not None
+        outcomes = cb.data.relationships.outcomes.data
+        self.assertEqual(len(outcomes), 1)
+
+        outcome = outcomes[0]
+        self.assertEqual(outcome.type, "task-result-outcomes")
+        self.assertEqual(outcome.attributes.outcome_id, "finding_0")
+        self.assertEqual(
+            outcome.attributes.description,
+            "A secret is stored in plaintext as an env var.",
+        )
+
+        # Severity tag must be present and reflect CRITICAL → error level
+        severity_tags = outcome.attributes.tags.get("Severity", [])
+        self.assertEqual(len(severity_tags), 1)
+        self.assertEqual(severity_tags[0].label, "CRITICAL")
+        self.assertEqual(severity_tags[0].level, "error")
+
+        # Body must contain the resource identifier and recommendation block
+        assert outcome.attributes.body is not None
+        self.assertIn(
+            "### Resource: `aws_lambda_function.api` (aws_lambda_function)",
+            outcome.attributes.body,
+        )
+        self.assertIn(
+            "#### Recommendation\n```\nUse AWS Secrets Manager instead.\n```",
+            outcome.attributes.body,
+        )
+
+        # Serialised payload must use the JSON:API alias "outcome-id"
+        serialised = cb.model_dump_json(by_alias=True, exclude_none=True)
+        self.assertIn('"outcome-id":"finding_0"', serialised)
+
+    # ------------------------------------------------------------------
     # Endpoint: plan download failure → 500
     # ------------------------------------------------------------------
 
